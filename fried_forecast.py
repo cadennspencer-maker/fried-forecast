@@ -18,8 +18,9 @@ from bs4 import BeautifulSoup
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
-EMAIL_ADDRESS = "cadennspencer@gmail.com"
-EMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")  # Set in GitHub Secrets
+EMAIL_SENDER    = "friedforecast@gmail.com"   # Sends from this account
+EMAIL_RECIPIENT = "cadennspencer@gmail.com"   # Report delivered to this inbox
+EMAIL_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")  # Set in GitHub Secrets
 
 SF_EMAIL    = os.environ.get("SF_EMAIL", "")      # Your surf-forecast.com login
 SF_PASSWORD = os.environ.get("SF_PASSWORD", "")   # Set in GitHub Secrets
@@ -909,15 +910,15 @@ def send_email(html_body):
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🏄 The Fried Forecast — {datetime.now().strftime('%B %d, %Y')}"
-    msg["From"]    = EMAIL_ADDRESS
-    msg["To"]      = EMAIL_ADDRESS
+    msg["From"]    = EMAIL_SENDER
+    msg["To"]      = EMAIL_RECIPIENT
 
     msg.attach(MIMEText(html_body, "html"))
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_ADDRESS, EMAIL_ADDRESS, msg.as_string())
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
         log.info("✅ Fried Forecast email sent successfully!")
     except Exception as e:
         log.error(f"Failed to send email: {e}")
