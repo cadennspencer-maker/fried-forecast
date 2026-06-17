@@ -1,12 +1,12 @@
 name: 🏄 The Fried Forecast
 
 on:
-  # Runs every 2 weeks on Monday at 7am UTC
   schedule:
     - cron: '0 7 1,15 * *'
-
-  # Also lets you trigger it manually from GitHub anytime
   workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   run-forecast:
@@ -21,8 +21,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install requests beautifulsoup4 lxml
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install Python dependencies
+        run: pip install selenium beautifulsoup4 lxml webdriver-manager
 
       - name: Run The Fried Forecast
         env:
