@@ -1,40 +1,43 @@
 """
 The Fried Forecast 🦂
-Automated surf report — restarts browser every 50 spots to avoid memory crash
+Uses simple HTTP requests (no browser) — lightweight, no memory crashes
 """
 
-import os
-import re
-import time
-import smtplib
-import logging
+import os, re, time, smtplib, logging
 from datetime import datetime
 from collections import defaultdict
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
 EMAIL_SENDER    = "friedforecast@gmail.com"
 EMAIL_RECIPIENT = "cadennspencer@gmail.com"
 EMAIL_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")
+SF_EMAIL        = os.environ.get("SF_EMAIL", "")
+SF_PASSWORD     = os.environ.get("SF_PASSWORD", "")
 
-SF_EMAIL    = os.environ.get("SF_EMAIL", "")
-SF_PASSWORD = os.environ.get("SF_PASSWORD", "")
-
-TOP_SPOTS_PER_REGION = 7
-DELAY_BETWEEN_REQUESTS = 3
-BROWSER_RESTART_EVERY  = 40   # restart Chrome every N spots to avoid memory crash
+TOP_SPOTS_PER_REGION   = 7
+DELAY_BETWEEN_REQUESTS = 2
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+BASE = "https://www.surf-forecast.com"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.surf-forecast.com/",
+}
 
 # ─── SURF SPOTS ───────────────────────────────────────────────────────────────
 
@@ -427,150 +430,168 @@ REGIONS = {
     ],
 }
 
-# ─── BROWSER ──────────────────────────────────────────────────────────────────
+# ─── SESSION / LOGIN ──────────────────────────────────────────────────────────
 
-def create_driver():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,800")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-images")          # skip images = less memory
-    options.add_argument("--blink-settings=imagesEnabled=false")
-    options.add_argument("--js-flags=--max-old-space-size=256")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    return webdriver.Chrome(options=options)
+def create_session():
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-
-def login(driver):
     if not SF_EMAIL or not SF_PASSWORD:
-        log.warning("No SF credentials set — scraping as guest")
-        return
-    log.info("Logging in...")
-    driver.get("https://www.surf-forecast.com/sign_in")
+        log.warning("No SF credentials — guest mode (48hr only)")
+        return session
+
+    log.info("Logging in to surf-forecast.com...")
     try:
-        # Wait up to 10s for the email field to appear
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.NAME, "user[email]"))
+        # Get login page and extract CSRF token
+        r = session.get(f"{BASE}/sign_in", timeout=20)
+        soup = BeautifulSoup(r.text, "lxml")
+        csrf = ""
+        tag = soup.find("input", {"name": "authenticity_token"})
+        if tag:
+            csrf = tag.get("value", "")
+
+        resp = session.post(
+            f"{BASE}/sign_in",
+            data={
+                "user[email]":    SF_EMAIL,
+                "user[password]": SF_PASSWORD,
+                "authenticity_token": csrf,
+                "commit": "Log in",
+            },
+            allow_redirects=True,
+            timeout=20,
         )
-        driver.find_element(By.NAME, "user[email]").send_keys(SF_EMAIL)
-        driver.find_element(By.NAME, "user[password]").send_keys(SF_PASSWORD)
-        driver.find_element(By.NAME, "user[password]").submit()
-        time.sleep(4)
-        if "sign_in" not in driver.current_url:
+        if "sign_in" not in resp.url:
             log.info("Login successful ✓")
         else:
-            log.error("Login failed — check SF_EMAIL / SF_PASSWORD")
+            log.error("Login failed — check SF_EMAIL / SF_PASSWORD secrets")
     except Exception as e:
         log.error(f"Login error: {e}")
+
+    return session
 
 
 # ─── SCRAPING ─────────────────────────────────────────────────────────────────
 
-def fetch_spot(driver, slug, spot_name):
-    base = "https://www.surf-forecast.com/breaks"
-    slots, tides = [], []
-
-    # Forecast
-    try:
-        driver.get(f"{base}/{slug}/forecasts/latest")
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "table.forecast-table, .forecast-table__container"))
-        )
-        time.sleep(2)
-        slots = parse_forecast(BeautifulSoup(driver.page_source, "lxml"), spot_name)
-    except Exception as e:
-        log.warning(f"Forecast failed for {spot_name}: {e}")
-
-    time.sleep(DELAY_BETWEEN_REQUESTS)
-
-    # Tides
-    try:
-        driver.get(f"{base}/{slug}/tides/latest")
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.TAG_NAME, "table"))
-        )
-        time.sleep(2)
-        tides = parse_tides(BeautifulSoup(driver.page_source, "lxml"))
-    except Exception as e:
-        log.warning(f"Tides failed for {spot_name}: {e}")
-
-    time.sleep(DELAY_BETWEEN_REQUESTS)
-    return slots, tides
+def fetch_page(session, url, retries=3):
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=25)
+            if r.status_code == 200:
+                return r.text
+            log.warning(f"HTTP {r.status_code} for {url}")
+        except Exception as e:
+            log.warning(f"Attempt {attempt+1} failed for {url}: {e}")
+            time.sleep(3)
+    return ""
 
 
-def parse_forecast(soup, spot_name):
+def parse_forecast(html, spot_name):
+    """
+    Parse the forecast table. surf-forecast.com serves data in the HTML
+    even without JS — the table rows have class names we can target.
+    Also parses the plain-text summary section as fallback.
+    """
+    soup = BeautifulSoup(html, "lxml")
     results = []
-    table = soup.find("table", class_=lambda c: c and "forecast-table" in c)
-    if not table:
-        return results
 
-    dates, times, stars = [], [], []
-    wave_heights, periods, swell_dirs = [], [], []
-    wind_speeds, wind_dirs, weather_desc = [], [], []
+    # ── Try the forecast table first ──
+    table = soup.find("table", class_=lambda c: c and "forecast-table" in " ".join(c if isinstance(c, list) else [c]))
 
-    for row in table.find_all("tr"):
-        classes = " ".join(row.get("class", []))
-        cells   = row.find_all(["td", "th"])
+    if table:
+        dates, times, stars = [], [], []
+        wave_heights, periods, swell_dirs = [], [], []
+        wind_speeds, wind_dirs, weather_desc = [], [], []
 
-        if "forecast-table-days" in classes:
-            for cell in cells:
-                dates.extend([cell.get_text(strip=True)] * int(cell.get("colspan", 1)))
-        elif "forecast-table-time" in classes:
-            for cell in cells:
-                times.append(cell.get_text(strip=True))
-        elif "rating" in classes:
-            for cell in cells:
-                img = cell.find("img")
-                n = 0
-                if img:
-                    m = re.search(r"(\d+)", img.get("alt", "") or img.get("src", ""))
-                    n = int(m.group(1)) if m else 0
-                stars.append(n)
-        elif "wave-height" in classes or "waveheight" in classes:
-            for cell in cells:
-                wave_heights.append(cell.get_text(strip=True))
-        elif "period" in classes:
-            for cell in cells:
-                periods.append(cell.get_text(strip=True))
-        elif "swell-direction" in classes or "swelldirection" in classes:
-            for cell in cells:
-                img = cell.find("img")
-                swell_dirs.append(img.get("alt", "") if img else "")
-        elif "wind-speed" in classes or "windspeed" in classes:
-            for cell in cells:
-                wind_speeds.append(cell.get_text(strip=True))
-        elif "wind-direction" in classes or "winddirection" in classes:
-            for cell in cells:
-                img = cell.find("img")
-                wind_dirs.append(img.get("alt", "") if img else "")
-        elif "weather" in classes:
-            for cell in cells:
-                img = cell.find("img")
-                weather_desc.append(img.get("alt", "") if img else "")
+        for row in table.find_all("tr"):
+            cls = " ".join(row.get("class", []))
+            cells = row.find_all(["td", "th"])
 
-    for i in range(len(stars)):
-        results.append({
-            "spot":        spot_name,
-            "date":        dates[i]        if i < len(dates)        else "",
-            "time":        times[i]        if i < len(times)        else "",
-            "stars":       stars[i],
-            "wave_height": wave_heights[i] if i < len(wave_heights) else "",
-            "period":      periods[i]      if i < len(periods)      else "",
-            "swell_dir":   swell_dirs[i]   if i < len(swell_dirs)   else "",
-            "wind_speed":  wind_speeds[i]  if i < len(wind_speeds)  else "",
-            "wind_dir":    wind_dirs[i]    if i < len(wind_dirs)    else "",
-            "weather":     weather_desc[i] if i < len(weather_desc) else "",
-        })
+            if "days" in cls:
+                for cell in cells:
+                    dates.extend([cell.get_text(strip=True)] * int(cell.get("colspan", 1)))
+            elif "time" in cls:
+                for cell in cells:
+                    times.append(cell.get_text(strip=True))
+            elif "rating" in cls:
+                for cell in cells:
+                    img = cell.find("img")
+                    n = 0
+                    if img:
+                        src = img.get("src", "") + img.get("alt", "") + img.get("title", "")
+                        m = re.search(r"(\d+)", src)
+                        n = int(m.group(1)) if m else 0
+                    # Also try data attributes
+                    val = cell.get("data-value") or cell.get("data-rating")
+                    if val:
+                        try: n = int(float(val))
+                        except: pass
+                    stars.append(n)
+            elif "wave" in cls and "height" in cls:
+                for cell in cells:
+                    wave_heights.append(cell.get_text(strip=True))
+            elif "period" in cls:
+                for cell in cells:
+                    periods.append(cell.get_text(strip=True))
+            elif "swell" in cls and "dir" in cls:
+                for cell in cells:
+                    img = cell.find("img")
+                    swell_dirs.append(img.get("alt", img.get("title", "")) if img else "")
+            elif "wind" in cls and "speed" in cls:
+                for cell in cells:
+                    wind_speeds.append(cell.get_text(strip=True))
+            elif "wind" in cls and "dir" in cls:
+                for cell in cells:
+                    img = cell.find("img")
+                    wind_dirs.append(img.get("alt", img.get("title", "")) if img else "")
+            elif "weather" in cls:
+                for cell in cells:
+                    img = cell.find("img")
+                    weather_desc.append(img.get("alt", img.get("title", "")) if img else "")
+
+        for i in range(len(stars)):
+            results.append({
+                "spot":        spot_name,
+                "date":        dates[i]        if i < len(dates)        else "",
+                "time":        times[i]        if i < len(times)        else "",
+                "stars":       stars[i],
+                "wave_height": wave_heights[i] if i < len(wave_heights) else "",
+                "period":      periods[i]      if i < len(periods)      else "",
+                "swell_dir":   swell_dirs[i]   if i < len(swell_dirs)   else "",
+                "wind_speed":  wind_speeds[i]  if i < len(wind_speeds)  else "",
+                "wind_dir":    wind_dirs[i]    if i < len(wind_dirs)    else "",
+                "weather":     weather_desc[i] if i < len(weather_desc) else "",
+            })
+
+    # ── Fallback: parse the plain-text summary bullets ──
+    if not results:
+        summary_items = soup.find_all("li")
+        for item in summary_items:
+            text = item.get_text(strip=True)
+            # e.g. "Morning surf (18 Jun) - 2.5ft (0.8m), 10s period with WNW swell."
+            m = re.search(
+                r"(Morning|Afternoon|Evening)[^\(]*\(([^)]+)\)[^\d]*([\d\.]+)ft.*?([\d\.]+)m.*?([\d]+)s.*?([NSEW]+)\s+swell",
+                text, re.I
+            )
+            if m:
+                results.append({
+                    "spot":        spot_name,
+                    "date":        m.group(2),
+                    "time":        m.group(1),
+                    "stars":       0,   # no star data in summary
+                    "wave_height": f"{m.group(3)}ft ({m.group(4)}m)",
+                    "period":      m.group(5),
+                    "swell_dir":   m.group(6),
+                    "wind_speed":  "",
+                    "wind_dir":    "",
+                    "weather":     "",
+                })
+
     return results
 
 
-def parse_tides(soup):
+def parse_tides(html):
+    soup = BeautifulSoup(html, "lxml")
     tides, current_date = [], ""
     table = soup.find("table")
     if not table:
@@ -582,6 +603,20 @@ def parse_tides(soup):
         elif len(texts) >= 3 and texts[0].lower() in ("high", "low"):
             tides.append({"date": current_date, "type": texts[0], "time": texts[1], "height": texts[2]})
     return tides
+
+
+def fetch_spot(session, slug, spot_name):
+    forecast_url = f"{BASE}/breaks/{slug}/forecasts/latest/six_day"
+    tide_url     = f"{BASE}/breaks/{slug}/tides/latest"
+
+    forecast_html = fetch_page(session, forecast_url)
+    time.sleep(DELAY_BETWEEN_REQUESTS)
+    tide_html = fetch_page(session, tide_url)
+    time.sleep(DELAY_BETWEEN_REQUESTS)
+
+    slots = parse_forecast(forecast_html, spot_name) if forecast_html else []
+    tides = parse_tides(tide_html) if tide_html else []
+    return slots, tides
 
 
 # ─── REPORT ───────────────────────────────────────────────────────────────────
@@ -639,7 +674,7 @@ body{{font-family:'Helvetica Neue',Arial,sans-serif;background:#0a0000;color:#e8
                 tides_by_date[t["date"]].append(t)
 
         if not days:
-            html += '<div class="day-block"><div class="no-waves">⚠️ Could not retrieve data for this region.</div></div>\n'
+            html += '<div class="day-block"><div class="no-waves">⚠️ Could not retrieve data.</div></div>\n'
         else:
             for date_str in sorted(days.keys()):
                 html += f'<div class="day-block"><div class="day-title">📅 {date_str}</div>\n'
@@ -651,16 +686,21 @@ body{{font-family:'Helvetica Neue',Arial,sans-serif;background:#0a0000;color:#e8
                 top = sorted(spot_best.values(), key=lambda x: x["stars"], reverse=True)
                 top = [s for s in top if s["stars"] > 0][:TOP_SPOTS_PER_REGION]
                 if not top:
+                    # Show top by wave height if no star data
+                    top = sorted(spot_best.values(), key=lambda x: x["wave_height"], reverse=True)[:TOP_SPOTS_PER_REGION]
+                    top = [s for s in top if s["wave_height"]]
+                if not top:
                     html += '<div class="no-waves">🍺 Waves Blow! Beer barrels at the local 🍺</div>\n'
                 else:
                     for i, slot in enumerate(top, 1):
                         tide_parts = [f"{t['type']}: {t['height']} @ {t['time']}"
                                       for t in tides_by_date.get(date_str, [])[:4]]
                         tide_str = " / ".join(tide_parts) or "Tide data unavailable"
+                        star_line = stars_display(slot['stars']) if slot['stars'] > 0 else "⭐ Rating N/A"
                         html += f"""<div class="spot-card">
 <div class="spot-name">#{i} {slot['spot_name']}</div>
 <div class="spot-type">{slot['spot_type']}</div>
-<div class="stars">{stars_display(slot['stars'])}</div>
+<div class="stars">{star_line}</div>
 <div class="best-window">🕐 Best window: {slot['time']}</div>
 <div class="data-row">
 🌊 {slot['wave_height']} &nbsp;|&nbsp; ⏱️ {slot['period']}s &nbsp;|&nbsp; 🧭 Swell: {slot['swell_dir']}<br>
@@ -699,47 +739,26 @@ def send_email(html_body):
 
 def main():
     log.info("🦂 Starting The Fried Forecast...")
+    session = create_session()
+    all_region_data = {}
+    total = sum(len(v) for v in REGIONS.values())
+    done = 0
 
-    # Flatten all spots into one list, keeping track of region
-    all_spots = []
     for region_name, spots in REGIONS.items():
-        for spot in spots:
-            all_spots.append((region_name, spot))
-
-    # Results dict: region -> list of (name, type, slots, tides)
-    results = defaultdict(list)
-
-    driver = create_driver()
-    login(driver)
-    spots_done = 0
-
-    try:
-        for region_name, (spot_name, slug, spot_type) in all_spots:
-            # Restart browser every N spots to prevent memory crash
-            if spots_done > 0 and spots_done % BROWSER_RESTART_EVERY == 0:
-                log.info(f"♻️  Restarting browser after {spots_done} spots...")
-                driver.quit()
-                time.sleep(3)
-                driver = create_driver()
-                login(driver)
-
-            log.info(f"[{spots_done+1}/{len(all_spots)}] {region_name} → {spot_name}")
-            slots, tides = fetch_spot(driver, slug, spot_name)
-            results[region_name].append((spot_name, spot_type, slots, tides))
-            spots_done += 1
-
-    finally:
-        driver.quit()
+        log.info(f"Scraping: {region_name} ({len(spots)} spots)")
+        spot_data_list = []
+        for spot_name, slug, spot_type in spots:
+            done += 1
+            log.info(f"  [{done}/{total}] {spot_name}")
+            slots, tides = fetch_spot(session, slug, spot_name)
+            spot_data_list.append((spot_name, spot_type, slots, tides))
+        all_region_data[region_name] = spot_data_list
 
     log.info("Building report...")
-    # Preserve original region order
-    ordered = {rn: results[rn] for rn in REGIONS if rn in results}
-    html = build_report(ordered)
-
+    html = build_report(all_region_data)
     log.info("Sending email...")
     send_email(html)
     log.info("Done! 🦂")
-
 
 if __name__ == "__main__":
     main()
