@@ -27,6 +27,5 @@ jobs:
       - name: Run The Fried Forecast
         env:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          SF_EMAIL:           ${{ secrets.SF_EMAIL }}
-          SF_PASSWORD:        ${{ secrets.SF_PASSWORD }}
+          SF_COOKIE:          ${{ secrets.SF_COOKIE }}
         run: python fried_forecast.py
