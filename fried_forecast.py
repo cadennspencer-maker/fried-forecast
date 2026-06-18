@@ -17,8 +17,7 @@ from bs4 import BeautifulSoup
 EMAIL_SENDER    = "friedforecast@gmail.com"
 EMAIL_RECIPIENT = "cadennspencer@gmail.com"
 EMAIL_PASSWORD  = os.environ.get("GMAIL_APP_PASSWORD", "")
-SF_EMAIL        = os.environ.get("SF_EMAIL", "")
-SF_PASSWORD     = os.environ.get("SF_PASSWORD", "")
+SF_COOKIE       = os.environ.get("SF_COOKIE", "")
 
 TOP_SPOTS_PER_REGION   = 7
 DELAY_BETWEEN_REQUESTS = 2
@@ -436,37 +435,19 @@ def create_session():
     session = requests.Session()
     session.headers.update(HEADERS)
 
-    if not SF_EMAIL or not SF_PASSWORD:
-        log.warning("No SF credentials — guest mode (48hr only)")
+    if not SF_COOKIE:
+        log.warning("No SF_COOKIE set — scraping as guest (48hr only)")
         return session
 
-    log.info("Logging in to surf-forecast.com...")
-    try:
-        # Get login page and extract CSRF token
-        r = session.get(f"{BASE}/sign_in", timeout=20)
-        soup = BeautifulSoup(r.text, "lxml")
-        csrf = ""
-        tag = soup.find("input", {"name": "authenticity_token"})
-        if tag:
-            csrf = tag.get("value", "")
+    log.info("Setting session cookie...")
+    session.cookies.set("_session_id", SF_COOKIE, domain="www.surf-forecast.com")
 
-        resp = session.post(
-            f"{BASE}/sign_in",
-            data={
-                "user[email]":    SF_EMAIL,
-                "user[password]": SF_PASSWORD,
-                "authenticity_token": csrf,
-                "commit": "Log in",
-            },
-            allow_redirects=True,
-            timeout=20,
-        )
-        if "sign_in" not in resp.url:
-            log.info("Login successful ✓")
-        else:
-            log.error("Login failed — check SF_EMAIL / SF_PASSWORD secrets")
-    except Exception as e:
-        log.error(f"Login error: {e}")
+    # Verify login worked
+    r = session.get(f"{BASE}/breaks/Mundaka/forecasts/latest/six_day", timeout=20)
+    if "sign_in" in r.url or "log_in" in r.url:
+        log.error("Cookie auth failed — cookie may have expired")
+    else:
+        log.info("Cookie auth successful ✓")
 
     return session
 
