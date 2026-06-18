@@ -1,7 +1,6 @@
 """
-The Fried Forecast 🤙
-Automated surf report for Northern Spain, Portugal, France & Morocco
-Uses Selenium to render JavaScript and scrape surf-forecast.com
+The Fried Forecast 🦂
+Automated surf report — restarts browser every 50 spots to avoid memory crash
 """
 
 import os
@@ -31,7 +30,8 @@ SF_EMAIL    = os.environ.get("SF_EMAIL", "")
 SF_PASSWORD = os.environ.get("SF_PASSWORD", "")
 
 TOP_SPOTS_PER_REGION = 7
-DELAY_BETWEEN_REQUESTS = 4
+DELAY_BETWEEN_REQUESTS = 3
+BROWSER_RESTART_EVERY  = 40   # restart Chrome every N spots to avoid memory crash
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -246,7 +246,7 @@ REGIONS = {
         ("Playa de San Cibrao",           "Playade-San-Cibrao",             "beach"),
         ("Playa de San Miguel de Reinante","Playade-San-Miguelde-Reinante", "beach"),
         ("Playa de San Roman",            "Playade-San-Roman",              "beach"),
-        ("Playa de San Xurxo",            "Playade-San-Xurxo",              "beach/point"),
+        ("Playa de San Xurxo",            "Playade-San-Xurxo",             "beach/point"),
         ("Playa de Sarrigal",             "Playade-Sarrigal",               "beach"),
         ("Playa de Seaia",                "Playade-Seaia",                  "beach"),
         ("Playa de Soesto",               "Playa-de-Soesto",                "beach"),
@@ -427,47 +427,45 @@ REGIONS = {
     ],
 }
 
-# ─── SELENIUM BROWSER ─────────────────────────────────────────────────────────
+# ─── BROWSER ──────────────────────────────────────────────────────────────────
 
 def create_driver():
-    """Create a headless Chrome browser."""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1280,800")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-images")          # skip images = less memory
+    options.add_argument("--blink-settings=imagesEnabled=false")
+    options.add_argument("--js-flags=--max-old-space-size=256")
     options.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
-    driver = webdriver.Chrome(options=options)
-    return driver
+    return webdriver.Chrome(options=options)
 
 
 def login(driver):
-    """Log into surf-forecast.com."""
     if not SF_EMAIL or not SF_PASSWORD:
-        log.warning("No SF credentials — scraping as guest (6-day forecast only)")
+        log.warning("No SF credentials set — scraping as guest")
         return
-
-    log.info("Logging in to surf-forecast.com...")
+    log.info("Logging in...")
     driver.get("https://www.surf-forecast.com/sign_in")
-    time.sleep(3)
-
     try:
-        email_field = driver.find_element(By.ID, "user_email")
-        pass_field  = driver.find_element(By.ID, "user_password")
-        email_field.send_keys(SF_EMAIL)
-        pass_field.send_keys(SF_PASSWORD)
-        pass_field.submit()
+        # Wait up to 10s for the email field to appear
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.NAME, "user[email]"))
+        )
+        driver.find_element(By.NAME, "user[email]").send_keys(SF_EMAIL)
+        driver.find_element(By.NAME, "user[password]").send_keys(SF_PASSWORD)
+        driver.find_element(By.NAME, "user[password]").submit()
         time.sleep(4)
         if "sign_in" not in driver.current_url:
             log.info("Login successful ✓")
         else:
-            log.error("Login may have failed — check credentials")
+            log.error("Login failed — check SF_EMAIL / SF_PASSWORD")
     except Exception as e:
         log.error(f"Login error: {e}")
 
@@ -475,114 +473,88 @@ def login(driver):
 # ─── SCRAPING ─────────────────────────────────────────────────────────────────
 
 def fetch_spot(driver, slug, spot_name):
-    """Fetch forecast and tide data for one spot using Selenium."""
     base = "https://www.surf-forecast.com/breaks"
+    slots, tides = [], []
 
-    # ── Forecast ──
-    slots = []
+    # Forecast
     try:
         driver.get(f"{base}/{slug}/forecasts/latest")
-        # Wait for the forecast table to appear
         WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "forecast-table"))
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table.forecast-table, .forecast-table__container"))
         )
         time.sleep(2)
-        soup = BeautifulSoup(driver.page_source, "lxml")
-        slots = parse_forecast(soup, spot_name)
+        slots = parse_forecast(BeautifulSoup(driver.page_source, "lxml"), spot_name)
     except Exception as e:
-        log.warning(f"Forecast fetch failed for {spot_name}: {e}")
+        log.warning(f"Forecast failed for {spot_name}: {e}")
 
     time.sleep(DELAY_BETWEEN_REQUESTS)
 
-    # ── Tides ──
-    tides = []
+    # Tides
     try:
         driver.get(f"{base}/{slug}/tides/latest")
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.TAG_NAME, "table"))
         )
         time.sleep(2)
-        soup = BeautifulSoup(driver.page_source, "lxml")
-        tides = parse_tides(soup)
+        tides = parse_tides(BeautifulSoup(driver.page_source, "lxml"))
     except Exception as e:
-        log.warning(f"Tide fetch failed for {spot_name}: {e}")
+        log.warning(f"Tides failed for {spot_name}: {e}")
 
     time.sleep(DELAY_BETWEEN_REQUESTS)
-
     return slots, tides
 
 
 def parse_forecast(soup, spot_name):
-    """Parse the rendered forecast table."""
     results = []
     table = soup.find("table", class_=lambda c: c and "forecast-table" in c)
     if not table:
         return results
 
-    rows = table.find_all("tr")
+    dates, times, stars = [], [], []
+    wave_heights, periods, swell_dirs = [], [], []
+    wind_speeds, wind_dirs, weather_desc = [], [], []
 
-    dates        = []
-    times        = []
-    stars        = []
-    wave_heights = []
-    periods      = []
-    swell_dirs   = []
-    wind_speeds  = []
-    wind_dirs    = []
-    weather_desc = []
-
-    for row in rows:
+    for row in table.find_all("tr"):
         classes = " ".join(row.get("class", []))
         cells   = row.find_all(["td", "th"])
 
         if "forecast-table-days" in classes:
             for cell in cells:
-                span = int(cell.get("colspan", 1))
-                dates.extend([cell.get_text(strip=True)] * span)
-
+                dates.extend([cell.get_text(strip=True)] * int(cell.get("colspan", 1)))
         elif "forecast-table-time" in classes:
             for cell in cells:
                 times.append(cell.get_text(strip=True))
-
-        elif "forecast-table__row--rating" in classes or "rating" in classes:
+        elif "rating" in classes:
             for cell in cells:
                 img = cell.find("img")
                 n = 0
                 if img:
-                    alt = img.get("alt", "") or img.get("title", "") or img.get("src", "")
-                    m = re.search(r"(\d+)", alt)
+                    m = re.search(r"(\d+)", img.get("alt", "") or img.get("src", ""))
                     n = int(m.group(1)) if m else 0
                 stars.append(n)
-
-        elif "forecast-table__row--wave-height" in classes or "wave-height" in classes:
+        elif "wave-height" in classes or "waveheight" in classes:
             for cell in cells:
                 wave_heights.append(cell.get_text(strip=True))
-
-        elif "forecast-table__row--period" in classes or "period" in classes:
+        elif "period" in classes:
             for cell in cells:
                 periods.append(cell.get_text(strip=True))
-
-        elif "forecast-table__row--swell-direction" in classes or "swell-direction" in classes:
+        elif "swell-direction" in classes or "swelldirection" in classes:
             for cell in cells:
                 img = cell.find("img")
                 swell_dirs.append(img.get("alt", "") if img else "")
-
-        elif "forecast-table__row--wind-speed" in classes or "wind-speed" in classes:
+        elif "wind-speed" in classes or "windspeed" in classes:
             for cell in cells:
                 wind_speeds.append(cell.get_text(strip=True))
-
-        elif "forecast-table__row--wind-direction" in classes or "wind-direction" in classes:
+        elif "wind-direction" in classes or "winddirection" in classes:
             for cell in cells:
                 img = cell.find("img")
                 wind_dirs.append(img.get("alt", "") if img else "")
-
-        elif "forecast-table__row--weather" in classes or "weather" in classes:
+        elif "weather" in classes:
             for cell in cells:
                 img = cell.find("img")
                 weather_desc.append(img.get("alt", "") if img else "")
 
-    n = len(stars)
-    for i in range(n):
+    for i in range(len(stars)):
         results.append({
             "spot":        spot_name,
             "date":        dates[i]        if i < len(dates)        else "",
@@ -595,42 +567,29 @@ def parse_forecast(soup, spot_name):
             "wind_dir":    wind_dirs[i]    if i < len(wind_dirs)    else "",
             "weather":     weather_desc[i] if i < len(weather_desc) else "",
         })
-
     return results
 
 
 def parse_tides(soup):
-    """Parse tide table."""
-    tides = []
+    tides, current_date = [], ""
     table = soup.find("table")
     if not table:
         return tides
-
-    current_date = ""
     for row in table.find_all("tr"):
-        cells = row.find_all(["td", "th"])
-        texts = [c.get_text(strip=True) for c in cells]
-
+        texts = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
         if len(texts) == 1 and re.search(r"\d{4}", texts[0]):
             current_date = texts[0]
         elif len(texts) >= 3 and texts[0].lower() in ("high", "low"):
-            tides.append({
-                "date":   current_date,
-                "type":   texts[0],
-                "time":   texts[1],
-                "height": texts[2],
-            })
-
+            tides.append({"date": current_date, "type": texts[0], "time": texts[1], "height": texts[2]})
     return tides
 
 
-# ─── REPORT BUILDING ──────────────────────────────────────────────────────────
+# ─── REPORT ───────────────────────────────────────────────────────────────────
 
 WEATHER_EMOJI = {
-    "sunny": "☀️", "clear": "☀️", "partly": "⛅",
-    "cloud": "☁️", "overcast": "☁️", "rain": "🌧️",
-    "shower": "🌦️", "storm": "⛈️", "thunder": "⛈️",
-    "fog": "🌫️", "mist": "🌫️", "snow": "❄️", "hail": "🌨️",
+    "sunny": "☀️", "clear": "☀️", "partly": "⛅", "cloud": "☁️",
+    "overcast": "☁️", "rain": "🌧️", "shower": "🌦️", "storm": "⛈️",
+    "thunder": "⛈️", "fog": "🌫️", "mist": "🌫️", "snow": "❄️",
 }
 
 def weather_fmt(desc):
@@ -642,49 +601,37 @@ def weather_fmt(desc):
 def stars_display(n):
     return f"{'⭐' * n} ({n}/10)"
 
-
 def build_report(all_region_data):
     now = datetime.now().strftime("%B %d, %Y")
     html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
-  body {{ font-family: 'Helvetica Neue', Arial, sans-serif; background: #0a0a1a; color: #e8e8e8; margin: 0; padding: 0; }}
-  .wrapper {{ max-width: 700px; margin: 0 auto; padding: 20px; }}
-  .header {{ text-align: center; padding: 40px 20px 20px; background: linear-gradient(135deg, #1a0000, #0a0000); border-radius: 16px; margin-bottom: 30px; }}
-  .header h1 {{ font-size: 42px; font-weight: 900; color: #f4d03f; letter-spacing: 2px; margin: 0 0 8px 0; text-shadow: 0 2px 10px rgba(244,208,63,0.4); }}
-  .header .subtitle {{ color: #ff8a80; font-size: 14px; letter-spacing: 1px; }}
-  .region-block {{ background: #111827; border-radius: 12px; margin-bottom: 30px; overflow: hidden; border: 1px solid #5f1e1e; }}
-  .region-title {{ background: linear-gradient(90deg, #b71c1c, #7f0000); padding: 16px 20px; font-size: 18px; font-weight: 700; color: #fff; letter-spacing: 1px; }}
-  .day-block {{ padding: 16px 20px; border-bottom: 1px solid #1e293b; }}
-  .day-block:last-child {{ border-bottom: none; }}
-  .day-title {{ font-size: 15px; font-weight: 700; color: #ff8a80; margin-bottom: 12px; padding-bottom: 6px; border-bottom: 1px solid #5f1e1e; }}
-  .no-waves {{ color: #f87171; font-weight: 600; font-size: 14px; padding: 4px 0; }}
-  .spot-card {{ background: #1e293b; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; border-left: 3px solid #f4d03f; }}
-  .spot-name {{ font-size: 15px; font-weight: 700; color: #f4d03f; margin-bottom: 4px; }}
-  .spot-type {{ font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }}
-  .stars {{ font-size: 14px; margin-bottom: 6px; }}
-  .best-window {{ font-size: 12px; color: #34d399; margin-bottom: 6px; }}
-  .data-row {{ font-size: 12px; color: #cbd5e1; line-height: 1.8; }}
-  .footer {{ text-align: center; padding: 20px; color: #475569; font-size: 12px; }}
-</style>
-</head>
-<body>
-<div class="wrapper">
-  <div class="header">
-    <h1>🦂 The Fried Forecast</h1>
-    <div class="subtitle">YOUR 16-DAY SURF REPORT &nbsp;|&nbsp; Generated {now}</div>
-  </div>
+body{{font-family:'Helvetica Neue',Arial,sans-serif;background:#0a0000;color:#e8e8e8;margin:0;padding:0}}
+.wrapper{{max-width:700px;margin:0 auto;padding:20px}}
+.header{{text-align:center;padding:40px 20px 20px;background:linear-gradient(135deg,#1a0000,#0a0000);border-radius:16px;margin-bottom:30px}}
+.header h1{{font-size:42px;font-weight:900;color:#f4d03f;letter-spacing:2px;margin:0 0 8px 0;text-shadow:0 2px 10px rgba(244,208,63,0.4)}}
+.header .subtitle{{color:#ff8a80;font-size:14px;letter-spacing:1px}}
+.region-block{{background:#111111;border-radius:12px;margin-bottom:30px;overflow:hidden;border:1px solid #5f1e1e}}
+.region-title{{background:linear-gradient(90deg,#b71c1c,#7f0000);padding:16px 20px;font-size:18px;font-weight:700;color:#fff;letter-spacing:1px}}
+.day-block{{padding:16px 20px;border-bottom:1px solid #2a0a0a}}
+.day-block:last-child{{border-bottom:none}}
+.day-title{{font-size:15px;font-weight:700;color:#ff8a80;margin-bottom:12px;padding-bottom:6px;border-bottom:1px solid #5f1e1e}}
+.no-waves{{color:#f87171;font-weight:600;font-size:14px;padding:4px 0}}
+.spot-card{{background:#1e0a0a;border-radius:8px;padding:12px 14px;margin-bottom:10px;border-left:3px solid #f4d03f}}
+.spot-name{{font-size:15px;font-weight:700;color:#f4d03f;margin-bottom:4px}}
+.spot-type{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:6px}}
+.stars{{font-size:14px;margin-bottom:6px}}
+.best-window{{font-size:12px;color:#34d399;margin-bottom:6px}}
+.data-row{{font-size:12px;color:#cbd5e1;line-height:1.8}}
+.footer{{text-align:center;padding:20px;color:#475569;font-size:12px}}
+</style></head><body><div class="wrapper">
+<div class="header"><h1>🦂 The Fried Forecast</h1>
+<div class="subtitle">YOUR 16-DAY SURF REPORT &nbsp;|&nbsp; Generated {now}</div></div>
 """
-
     for region_name, spot_data_list in all_region_data.items():
-        html += f'<div class="region-block">\n<div class="region-title">{region_name}</div>\n'
-
+        html += f'<div class="region-block"><div class="region-title">{region_name}</div>\n'
         days = defaultdict(list)
         tides_by_date = defaultdict(list)
-
         for spot_name, spot_type, slots, tides in spot_data_list:
             for slot in slots:
                 days[slot["date"]].append({**slot, "spot_name": spot_name, "spot_type": spot_type})
@@ -692,48 +639,39 @@ def build_report(all_region_data):
                 tides_by_date[t["date"]].append(t)
 
         if not days:
-            html += '<div class="day-block"><div class="no-waves">⚠️ Could not retrieve forecast data for this region.</div></div>\n'
+            html += '<div class="day-block"><div class="no-waves">⚠️ Could not retrieve data for this region.</div></div>\n'
         else:
             for date_str in sorted(days.keys()):
-                html += f'<div class="day-block">\n<div class="day-title">📅 {date_str}</div>\n'
-
+                html += f'<div class="day-block"><div class="day-title">📅 {date_str}</div>\n'
                 spot_best = {}
                 for slot in days[date_str]:
                     sn = slot["spot_name"]
                     if sn not in spot_best or slot["stars"] > spot_best[sn]["stars"]:
                         spot_best[sn] = slot
-
                 top = sorted(spot_best.values(), key=lambda x: x["stars"], reverse=True)
                 top = [s for s in top if s["stars"] > 0][:TOP_SPOTS_PER_REGION]
-
                 if not top:
                     html += '<div class="no-waves">🍺 Waves Blow! Beer barrels at the local 🍺</div>\n'
                 else:
                     for i, slot in enumerate(top, 1):
-                        tide_parts = []
-                        for t in tides_by_date.get(date_str, [])[:4]:
-                            tide_parts.append(f"{t['type']}: {t['height']} @ {t['time']}")
+                        tide_parts = [f"{t['type']}: {t['height']} @ {t['time']}"
+                                      for t in tides_by_date.get(date_str, [])[:4]]
                         tide_str = " / ".join(tide_parts) or "Tide data unavailable"
-
                         html += f"""<div class="spot-card">
-  <div class="spot-name">#{i} {slot['spot_name']}</div>
-  <div class="spot-type">{slot['spot_type']}</div>
-  <div class="stars">{stars_display(slot['stars'])}</div>
-  <div class="best-window">🕐 Best window: {slot['time']}</div>
-  <div class="data-row">
-    🌊 {slot['wave_height']} &nbsp;|&nbsp; ⏱️ {slot['period']}s &nbsp;|&nbsp; 🧭 Swell: {slot['swell_dir']}<br>
-    💨 Wind: {slot['wind_dir']} {slot['wind_speed']}<br>
-    🌊 Tides: {tide_str}<br>
-    {weather_fmt(slot['weather'])}
-  </div>
-</div>
-"""
+<div class="spot-name">#{i} {slot['spot_name']}</div>
+<div class="spot-type">{slot['spot_type']}</div>
+<div class="stars">{stars_display(slot['stars'])}</div>
+<div class="best-window">🕐 Best window: {slot['time']}</div>
+<div class="data-row">
+🌊 {slot['wave_height']} &nbsp;|&nbsp; ⏱️ {slot['period']}s &nbsp;|&nbsp; 🧭 Swell: {slot['swell_dir']}<br>
+💨 Wind: {slot['wind_dir']} {slot['wind_speed']}<br>
+🌊 Tides: {tide_str}<br>
+{weather_fmt(slot['weather'])}
+</div></div>\n"""
                 html += '</div>\n'
-
         html += '</div>\n'
-
-    html += """  <div class="footer">🤙 The Fried Forecast — Stay Salty<br>Data sourced from surf-forecast.com</div>
-</div></body></html>"""
+    html += '<div class="footer">🦂 The Fried Forecast — Stay Salty<br>Data sourced from surf-forecast.com</div>\n'
+    html += '</div></body></html>'
     return html
 
 
@@ -761,30 +699,46 @@ def send_email(html_body):
 
 def main():
     log.info("🦂 Starting The Fried Forecast...")
+
+    # Flatten all spots into one list, keeping track of region
+    all_spots = []
+    for region_name, spots in REGIONS.items():
+        for spot in spots:
+            all_spots.append((region_name, spot))
+
+    # Results dict: region -> list of (name, type, slots, tides)
+    results = defaultdict(list)
+
     driver = create_driver()
+    login(driver)
+    spots_done = 0
 
     try:
-        login(driver)
-        all_region_data = {}
+        for region_name, (spot_name, slug, spot_type) in all_spots:
+            # Restart browser every N spots to prevent memory crash
+            if spots_done > 0 and spots_done % BROWSER_RESTART_EVERY == 0:
+                log.info(f"♻️  Restarting browser after {spots_done} spots...")
+                driver.quit()
+                time.sleep(3)
+                driver = create_driver()
+                login(driver)
 
-        for region_name, spots in REGIONS.items():
-            log.info(f"Scraping: {region_name} ({len(spots)} spots)")
-            spot_data_list = []
-            for spot_name, slug, spot_type in spots:
-                log.info(f"  → {spot_name}")
-                slots, tides = fetch_spot(driver, slug, spot_name)
-                spot_data_list.append((spot_name, spot_type, slots, tides))
-            all_region_data[region_name] = spot_data_list
-
-        log.info("Building report...")
-        html = build_report(all_region_data)
-
-        log.info("Sending email...")
-        send_email(html)
+            log.info(f"[{spots_done+1}/{len(all_spots)}] {region_name} → {spot_name}")
+            slots, tides = fetch_spot(driver, slug, spot_name)
+            results[region_name].append((spot_name, spot_type, slots, tides))
+            spots_done += 1
 
     finally:
         driver.quit()
-        log.info("Done! 🤙")
+
+    log.info("Building report...")
+    # Preserve original region order
+    ordered = {rn: results[rn] for rn in REGIONS if rn in results}
+    html = build_report(ordered)
+
+    log.info("Sending email...")
+    send_email(html)
+    log.info("Done! 🦂")
 
 
 if __name__ == "__main__":
