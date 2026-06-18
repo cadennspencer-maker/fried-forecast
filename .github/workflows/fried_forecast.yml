@@ -1,4 +1,4 @@
-name: 🏄 The Fried Forecast
+name: 🦂 The Fried Forecast
 
 on:
   schedule:
@@ -21,15 +21,8 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Chrome
-        run: |
-          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
-          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update -q
-          sudo apt-get install -y google-chrome-stable
-
-      - name: Install Python dependencies
-        run: pip install selenium beautifulsoup4 lxml webdriver-manager
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml
 
       - name: Run The Fried Forecast
         env:
